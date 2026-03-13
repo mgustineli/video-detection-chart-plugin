@@ -3,7 +3,7 @@
 //
 // SVG line chart of per-frame detection counts with bidirectional
 // video sync:
-//   - Video → Chart: vertical red line tracks current frame
+//   - Video → Chart: vertical blue line tracks current frame
 //   - Chart → Video: click/drag on chart seeks the video
 //
 // Hand-written UMD (no build step). Uses FiftyOne globals:
@@ -234,8 +234,8 @@
         key: "bg",
         width: width,
         height: CHART_HEIGHT,
-        fill: "#1a1a2e",
-        rx: 8,
+        fill: "#18191A",
+        rx: 6,
       }),
     );
 
@@ -251,7 +251,7 @@
           y1: y,
           x2: width - MARGIN.right,
           y2: y,
-          stroke: "#333",
+          stroke: "#1E1F20",
           strokeWidth: 1,
           strokeDasharray: "4,4",
         }),
@@ -263,8 +263,8 @@
             key: "yl-" + t,
             x: MARGIN.left - 10,
             y: y + 4,
-            fill: "#999",
-            fontSize: 13,
+            fill: "#8F8D8B",
+            fontSize: 12,
             textAnchor: "end",
             fontFamily: "monospace",
           },
@@ -291,8 +291,8 @@
             key: "xl-" + xi,
             x: xScale(xv),
             y: CHART_HEIGHT - MARGIN.bottom + 20,
-            fill: "#999",
-            fontSize: 13,
+            fill: "#8F8D8B",
+            fontSize: 12,
             textAnchor: "middle",
             fontFamily: "monospace",
           },
@@ -307,7 +307,7 @@
           y1: MARGIN.top + plotHeight,
           x2: xScale(xv),
           y2: MARGIN.top + plotHeight + 5,
-          stroke: "#555",
+          stroke: "#404040",
           strokeWidth: 1,
         }),
       );
@@ -321,7 +321,7 @@
         y1: MARGIN.top + plotHeight,
         x2: width - MARGIN.right,
         y2: MARGIN.top + plotHeight,
-        stroke: "#555",
+        stroke: "#404040",
         strokeWidth: 1,
       }),
     );
@@ -332,7 +332,7 @@
         y1: MARGIN.top,
         x2: MARGIN.left,
         y2: MARGIN.top + plotHeight,
-        stroke: "#555",
+        stroke: "#404040",
         strokeWidth: 1,
       }),
     );
@@ -353,7 +353,7 @@
         h("path", {
           key: "area",
           d: areaD,
-          fill: "rgba(79, 195, 247, 0.08)",
+          fill: "rgba(255, 109, 4, 0.10)",
         }),
       );
     }
@@ -370,7 +370,7 @@
           key: "line",
           points: pts,
           fill: "none",
-          stroke: "#4fc3f7",
+          stroke: "#FF6D04",
           strokeWidth: 1.5,
           strokeLinejoin: "round",
           strokeLinecap: "round",
@@ -390,7 +390,7 @@
           y1: MARGIN.top,
           x2: cx,
           y2: MARGIN.top + plotHeight,
-          stroke: "#ff5252",
+          stroke: "#86B5F6",
           strokeWidth: 2,
           opacity: 0.85,
         }),
@@ -404,7 +404,7 @@
             key: "vlabel",
             x: cx,
             y: MARGIN.top - 10,
-            fill: "#ff5252",
+            fill: "#86B5F6",
             fontSize: 14,
             fontWeight: "bold",
             textAnchor: "middle",
@@ -429,8 +429,8 @@
             cx: cx,
             cy: yScale(counts[dataIdx]),
             r: 5,
-            fill: "#ff5252",
-            stroke: "#fff",
+            fill: "#86B5F6",
+            stroke: "#FFF9F5",
             strokeWidth: 2,
           }),
         );
@@ -442,8 +442,8 @@
               key: "vcount",
               x: cx + 10,
               y: yScale(counts[dataIdx]) - 8,
-              fill: "#ff5252",
-              fontSize: 13,
+              fill: "#86B5F6",
+              fontSize: 12,
               fontWeight: "bold",
               fontFamily: "monospace",
             },
@@ -461,7 +461,7 @@
           key: "ytitle",
           x: 16,
           y: CHART_HEIGHT / 2,
-          fill: "#888",
+          fill: "#6E6C6A",
           fontSize: 14,
           textAnchor: "middle",
           transform: "rotate(-90, 16, " + CHART_HEIGHT / 2 + ")",
@@ -479,7 +479,7 @@
           key: "xtitle",
           x: width / 2,
           y: CHART_HEIGHT - 5,
-          fill: "#888",
+          fill: "#6E6C6A",
           fontSize: 14,
           textAnchor: "middle",
           fontFamily: "sans-serif",
@@ -659,15 +659,15 @@
             alignItems: "center",
             justifyContent: "center",
             height: CHART_HEIGHT,
-            bgcolor: "#1a1a2e",
-            borderRadius: 2,
+            bgcolor: "#18191A",
+            borderRadius: 1.5,
             gap: 2,
           },
         },
-        h(CircularProgress, { size: 36, sx: { color: "#4fc3f7" } }),
+        h(CircularProgress, { size: 36, sx: { color: "#FF6D04" } }),
         h(
           Typography,
-          { variant: "body2", sx: { color: "#888" } },
+          { variant: "body2", sx: { color: "#8F8D8B" } },
           "Loading detection counts\u2026",
         ),
       );
@@ -681,19 +681,19 @@
           ref: containerRef,
           sx: {
             padding: 3,
-            bgcolor: "#1a1a2e",
-            borderRadius: 2,
+            bgcolor: "#18191A",
+            borderRadius: 1.5,
             textAlign: "center",
           },
         },
         h(
           Typography,
-          { sx: { color: "#ff5252", mb: 1 } },
+          { sx: { color: "#FF6767", mb: 1 } },
           "Error loading data",
         ),
         h(
           Typography,
-          { variant: "body2", sx: { color: "#999" } },
+          { variant: "body2", sx: { color: "#8F8D8B" } },
           String(error),
         ),
       );
@@ -707,14 +707,14 @@
           ref: containerRef,
           sx: {
             padding: 3,
-            bgcolor: "#1a1a2e",
-            borderRadius: 2,
+            bgcolor: "#18191A",
+            borderRadius: 1.5,
             textAlign: "center",
           },
         },
         h(
           Typography,
-          { sx: { color: "#999" } },
+          { sx: { color: "#8F8D8B" } },
           "No detection data available for this sample",
         ),
       );
@@ -748,19 +748,19 @@
             alignItems: "center",
             px: 2,
             py: 1,
-            bgcolor: "#12122a",
-            borderBottomLeftRadius: 8,
-            borderBottomRightRadius: 8,
+            bgcolor: "#0D0D0D",
+            borderBottomLeftRadius: 6,
+            borderBottomRightRadius: 6,
           },
         },
         h(
           Typography,
-          { variant: "body2", sx: { color: "#999", fontFamily: "monospace" } },
+          { variant: "body2", sx: { color: "#8F8D8B", fontFamily: "monospace" } },
           "Frame " + frameNumber + " / " + totalFrames,
         ),
         h(
           Typography,
-          { variant: "body2", sx: { color: "#999", fontFamily: "monospace" } },
+          { variant: "body2", sx: { color: "#8F8D8B", fontFamily: "monospace" } },
           data.fps + " FPS \u00B7 " + data.frames.length + " frames with data",
         ),
         h(
@@ -768,7 +768,7 @@
           {
             variant: "body2",
             sx: {
-              color: playing ? "#4fc3f7" : "#888",
+              color: playing ? "#FF6D04" : "#8F8D8B",
               fontFamily: "monospace",
               fontWeight: playing ? "bold" : "normal",
             },
