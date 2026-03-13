@@ -1,24 +1,140 @@
-"""Detection Count Chart Plugin
+"""Video Detection Chart Plugin
 
-Interactive SVG chart panel showing per-frame detection counts with
-bidirectional video sync. Click or drag on the chart to seek the video.
+Two panel variants for visualizing per-frame temporal data:
 
-Panels (JS — registered in index.umd.js):
-  - DetectionCountPlotInteractive — SVG chart with bidirectional video sync
+Panels:
+  - DetectionCountPlotInteractive (JS) — SVG chart with bidirectional video sync
+  - FrameDataPlot (Python) — Plotly chart with field selector and timeline sync
 
 Operators:
-  - get_detection_counts — returns per-frame detection counts for a sample
+  - get_temporal_fields — discovers plottable frame-level fields
+  - get_frame_values — returns per-frame values for any temporal field
+  - get_detection_counts — (legacy) returns per-frame detection counts
 """
 
+import fiftyone as fo
+import fiftyone.core.view as fov
 import fiftyone.operators as foo
 import fiftyone.operators.types as types
+from fiftyone import ViewField as F
+
+LOG_PREFIX = "[VideoDetectionChart]"
+
+
+def _get_fields(ctx):
+    """Discover plottable frame-level fields (Float, Int, List)."""
+    schema = ctx.view.get_frame_field_schema(
+        flat=True, ftype=(fo.FloatField, fo.IntField, fo.ListField)
+    )
+    # Filter out sub-paths (e.g., keep "detections.detections" but not
+    # "detections.detections.id")
+    paths = sorted(schema.keys())
+    top_paths = [
+        p for p in paths if not any(p.startswith(other + ".") for other in paths if other != p)
+    ]
+
+    fields = []
+    for path in top_paths:
+        field = schema[path]
+        if isinstance(field, fo.ListField):
+            fields.append({"path": path, "type": "list", "label": f"{path} (count)"})
+        elif isinstance(field, fo.FloatField):
+            fields.append({"path": path, "type": "float", "label": path})
+        elif isinstance(field, fo.IntField):
+            fields.append({"path": path, "type": "int", "label": path})
+
+    return fields
+
+
+def _get_frame_values(ctx, sample_id, field_path):
+    """Fetch per-frame values for a given field path."""
+    sample = ctx.dataset[sample_id]
+    fps = sample.metadata.frame_rate if sample.metadata else 30
+    total_frames = sample.metadata.total_frame_count if sample.metadata else 0
+
+    field = ctx.view.get_field("frames." + field_path)
+    if isinstance(field, fo.ListField):
+        expr = F("frames[]." + field_path).length()
+    else:
+        expr = "frames[]." + field_path
+
+    view = fov.make_optimized_select_view(ctx.view, [sample_id])
+    frame_numbers, values = view.values(["frames[].frame_number", expr])
+
+    # Replace None with 0
+    values = [v if v is not None else 0 for v in values]
+
+    return {
+        "frames": frame_numbers,
+        "values": values,
+        "fps": fps,
+        "total_frames": total_frames,
+        "field": field_path,
+    }
+
+
+class GetTemporalFields(foo.Operator):
+    """Discovers plottable frame-level fields for the current dataset."""
+
+    @property
+    def config(self):
+        return foo.OperatorConfig(
+            name="get_temporal_fields",
+            label="Get Temporal Fields",
+            unlisted=True,
+        )
+
+    def resolve_input(self, ctx):
+        inputs = types.Object()
+        inputs.str("sample_id", required=True)
+        return types.Property(inputs)
+
+    def execute(self, ctx):
+        try:
+            fields = _get_fields(ctx)
+            return {"fields": fields}
+        except Exception as e:
+            print(f"{LOG_PREFIX} Error discovering fields: {e}")
+            return {"error": str(e)}
+
+
+class GetFrameValues(foo.Operator):
+    """Returns per-frame values for any temporal field."""
+
+    @property
+    def config(self):
+        return foo.OperatorConfig(
+            name="get_frame_values",
+            label="Get Frame Values",
+            unlisted=True,
+        )
+
+    def resolve_input(self, ctx):
+        inputs = types.Object()
+        inputs.str("sample_id", required=True)
+        inputs.str("field", default="detections.detections")
+        return types.Property(inputs)
+
+    def execute(self, ctx):
+        sample_id = ctx.params.get("sample_id")
+        field_path = ctx.params.get("field", "detections.detections")
+        if not sample_id:
+            return {}
+
+        try:
+            result = _get_frame_values(ctx, sample_id, field_path)
+            print(
+                f"{LOG_PREFIX} Loaded {len(result['frames'])} frames"
+                f" for field '{field_path}'"
+            )
+            return result
+        except Exception as e:
+            print(f"{LOG_PREFIX} Error loading field '{field_path}': {e}")
+            return {"error": str(e)}
 
 
 class GetDetectionCounts(foo.Operator):
-    """Returns per-frame detection counts for a sample.
-
-    Called from the JS panel to load chart data.
-    """
+    """Legacy operator — delegates to _get_frame_values with detections."""
 
     @property
     def config(self):
@@ -39,30 +155,195 @@ class GetDetectionCounts(foo.Operator):
             return {}
 
         try:
-            sample = ctx.dataset[sample_id]
-
-            fps = sample.metadata.frame_rate if sample.metadata else 30
-            total_frames = (
-                sample.metadata.total_frame_count if sample.metadata else 0
-            )
-
-            sample_view = ctx.dataset.select(sample_id)
-            frame_numbers = sample_view.values("frames.frame_number")[0]
-            det_lists = sample_view.values("frames.detections.detections")[0]
-            counts = [len(d) if d else 0 for d in det_lists]
-
-            ctx.ops.notify(f"Loaded {len(frame_numbers)} frames")
-
+            result = _get_frame_values(ctx, sample_id, "detections.detections")
             return {
-                "frames": frame_numbers,
-                "counts": counts,
-                "fps": fps,
-                "total_frames": total_frames,
+                "frames": result["frames"],
+                "counts": result["values"],
+                "fps": result["fps"],
+                "total_frames": result["total_frames"],
             }
         except Exception as e:
-            print(f"[GetDetectionCounts] Error: {e}")
+            print(f"{LOG_PREFIX} Error: {e}")
             return {"error": str(e)}
 
 
+# ==========================================================
+# Python-only Panel: FrameDataPlot
+# Plotly bar chart with field selector and video timeline sync.
+# Uses FrameLoaderView (no timeline_name) to subscribe to the
+# video player's default timeline.
+# ==========================================================
+
+
+def _get_fields_for_panel(ctx):
+    """Discover plottable frame-level fields, returning (paths, labels)."""
+    fields = _get_fields(ctx)
+    paths = [f["path"] for f in fields]
+    labels = [f["label"] for f in fields]
+    return paths, labels
+
+
+def _get_panel_values(ctx, field_path):
+    """Fetch per-frame values for the Python panel."""
+    sample_id = ctx.current_sample
+
+    field = ctx.view.get_field("frames." + field_path)
+    if isinstance(field, fo.ListField):
+        expr = F("frames[]." + field_path).length()
+    else:
+        expr = "frames[]." + field_path
+
+    view = fov.make_optimized_select_view(ctx.view, [sample_id])
+    frame_numbers, values = view.values(["frames[].frame_number", expr])
+    values = [v if v is not None else 0 for v in values]
+
+    return frame_numbers, values
+
+
+class FrameDataPlot(foo.Panel):
+    """Python-only panel — Plotly bar chart of per-frame data with timeline sync."""
+
+    @property
+    def config(self):
+        return foo.PanelConfig(
+            name="frame_data_plot",
+            label="Frame Data Plot (Python)",
+            surfaces="modal",
+            unlisted=False,
+        )
+
+    def on_load(self, ctx):
+        fields, labels = _get_fields_for_panel(ctx)
+        ctx.panel.state.fields = fields
+        ctx.panel.state.field_labels = labels
+
+        if not fields:
+            return
+
+        # Default to detections.detections if available, else first field
+        selected = fields[0]
+        if "detections.detections" in fields:
+            selected = "detections.detections"
+        ctx.panel.state.selected_field = selected
+
+        self._load_plot(ctx, selected)
+
+    def on_change_current_sample(self, ctx):
+        self.on_load(ctx)
+
+    def on_field_select(self, ctx):
+        selected = ctx.panel.state.selected_field
+        if selected:
+            self._load_plot(ctx, selected)
+
+    def _load_plot(self, ctx, field_path):
+        """Load data and configure the Plotly bar chart."""
+        try:
+            frame_numbers, values = _get_panel_values(ctx, field_path)
+        except Exception as e:
+            print(f"{LOG_PREFIX} Panel error loading '{field_path}': {e}")
+            return
+
+        # Find the label for this field
+        label = field_path
+        fields = ctx.panel.state.fields or []
+        labels = ctx.panel.state.field_labels or []
+        for i, f in enumerate(fields):
+            if f == field_path:
+                label = labels[i]
+                break
+
+        ctx.panel.state.plot = {
+            "type": "scatter",
+            "mode": "lines+markers",
+            "x": frame_numbers,
+            "y": values,
+            "line": {"color": "#FF6D04", "width": 1.5},
+            "fill": "tozeroy",
+            "fillcolor": "rgba(255, 109, 4, 0.10)",
+            "marker": {"size": 6, "color": "rgba(0,0,0,0)"},
+            "selected": {
+                "marker": {
+                    "color": "#86B5F6",
+                    "size": 8,
+                    "line": {"color": "#FFF9F5", "width": 2},
+                },
+            },
+            "unselected": {"marker": {"opacity": 0}},
+            "selectedpoints": [],
+            "hovertemplate": (
+                f"<b>Frame</b>: %{{x}}<br>"
+                f"<b>{label}</b>: %{{y}}<extra></extra>"
+            ),
+        }
+        ctx.panel.state.plot_field = field_path
+
+    def render(self, ctx):
+        panel = types.Object()
+
+        # Field selector dropdown
+        fields = ctx.panel.state.fields or []
+        labels = ctx.panel.state.field_labels or []
+        field_choices = types.Choices()
+        for i, path in enumerate(fields):
+            field_choices.add_choice(path, label=labels[i] if i < len(labels) else path)
+
+        panel.enum(
+            "selected_field",
+            values=field_choices.values(),
+            label="Field",
+            view=types.AutocompleteView(),
+            on_change=self.on_field_select,
+        )
+
+        # Plotly chart
+        panel.plot(
+            "plot",
+            height=250,
+            layout={
+                "paper_bgcolor": "#18191A",
+                "plot_bgcolor": "#18191A",
+                "margin": {"t": 10, "b": 40, "l": 50, "r": 20},
+                "xaxis": {
+                    "title": "Frame Number",
+                    "color": "#8F8D8B",
+                    "gridcolor": "#1E1F20",
+                    "linecolor": "#404040",
+                },
+                "yaxis": {
+                    "title": ctx.panel.state.get("plot_field", "Value"),
+                    "color": "#8F8D8B",
+                    "gridcolor": "#1E1F20",
+                    "linecolor": "#404040",
+                },
+                "font": {"color": "#8F8D8B", "size": 12},
+            },
+        )
+
+        # FrameLoaderView — no timeline_name = subscribe to video player
+        panel.obj(
+            "frame_data",
+            view=types.FrameLoaderView(
+                on_load_range=self.on_load_range,
+                target="plot.selectedpoints",
+            ),
+        )
+
+        return types.Property(panel)
+
+    def on_load_range(self, ctx):
+        r = ctx.params.get("range")
+        chunk = {}
+        for i in range(r[0], r[1]):
+            chunk[f"frame_data.frames[{i}]"] = [i - 1]
+        ctx.panel.set_data(chunk)
+
+        field = ctx.panel.state.selected_field or ""
+        ctx.panel.set_state("frame_data.signature", field + str(r))
+
+
 def register(p):
+    p.register(GetTemporalFields)
+    p.register(GetFrameValues)
     p.register(GetDetectionCounts)
+    p.register(FrameDataPlot)

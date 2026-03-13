@@ -6,5 +6,8 @@ fiftyone:
   version: ">=0.21.0"
 panels:
   - DetectionCountPlotInteractive
+  - frame_data_plot
 operators:
+  - get_temporal_fields
+  - get_frame_values
   - get_detection_counts

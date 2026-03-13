@@ -1,7 +1,7 @@
 // ============================================================
 // DetectionCountPlotInteractive — JS Panel for video-detection-chart
 //
-// SVG line chart of per-frame detection counts with bidirectional
+// SVG line chart of per-frame temporal data with bidirectional
 // video sync:
 //   - Video → Chart: vertical blue line tracks current frame
 //   - Chart → Video: click/drag on chart seeks the video
@@ -162,6 +162,7 @@
     var totalFrames = props.totalFrames;
     var onFrameSeek = props.onFrameSeek;
     var width = props.width;
+    var yAxisTitle = props.yAxisTitle || "Detection Count";
 
     var plotWidth = width - MARGIN.left - MARGIN.right;
     var plotHeight = CHART_HEIGHT - MARGIN.top - MARGIN.bottom;
@@ -447,7 +448,7 @@
               fontWeight: "bold",
               fontFamily: "monospace",
             },
-            counts[dataIdx] + " det",
+            String(counts[dataIdx]),
           ),
         );
       }
@@ -467,7 +468,7 @@
           transform: "rotate(-90, 16, " + CHART_HEIGHT / 2 + ")",
           fontFamily: "sans-serif",
         },
-        "Detection Count",
+        yAxisTitle,
       ),
     );
 
@@ -535,6 +536,19 @@
     var containerWidth = _width[0];
     var setContainerWidth = _width[1];
 
+    // Field selector state
+    var _fields = useState([]);
+    var fields = _fields[0];
+    var setFields = _fields[1];
+
+    var _selectedField = useState("");
+    var selectedField = _selectedField[0];
+    var setSelectedField = _selectedField[1];
+
+    var _fieldsLoading = useState(true);
+    var fieldsLoading = _fieldsLoading[0];
+    var setFieldsLoading = _fieldsLoading[1];
+
     var containerRef = useRef(null);
     var prevSampleRef = useRef(null);
 
@@ -554,11 +568,15 @@
     var playing = videoState.playing;
     var modalLooker = videoState.modalLooker;
 
-    // --- Operator executor ---
-    var executor = null;
+    // --- Operator executors ---
+    var fieldsExecutor = null;
+    var dataExecutor = null;
     if (foo && typeof foo.useOperatorExecutor === "function") {
-      executor = foo.useOperatorExecutor(
-        "video-detection-chart/get_detection_counts",
+      fieldsExecutor = foo.useOperatorExecutor(
+        "video-detection-chart/get_temporal_fields",
+      );
+      dataExecutor = foo.useOperatorExecutor(
+        "video-detection-chart/get_frame_values",
       );
     } else {
       console.error(
@@ -567,60 +585,126 @@
       );
     }
 
-    // --- Load data when sample changes ---
+    // --- Load fields when sample changes ---
     useEffect(
       function () {
-        if (!modalSampleId || !executor) return;
+        if (!modalSampleId || !fieldsExecutor) return;
         if (modalSampleId === prevSampleRef.current) return;
         prevSampleRef.current = modalSampleId;
 
+        setFieldsLoading(true);
         setLoading(true);
         setError(null);
         setData(null);
+        setFields([]);
+        setSelectedField("");
 
-        console.log(LOG_PREFIX, "Loading data for sample", modalSampleId);
-        executor.execute({ sample_id: modalSampleId });
+        console.log(LOG_PREFIX, "Discovering fields for sample", modalSampleId);
+        fieldsExecutor.execute({ sample_id: modalSampleId });
       },
       [modalSampleId],
     );
 
-    // --- Watch executor result ---
+    // --- Watch fields result → auto-select first field → load data ---
     useEffect(
       function () {
-        if (!executor) return;
+        if (!fieldsExecutor) return;
+        if (fieldsExecutor.isExecuting) return;
 
-        if (executor.isExecuting) return;
-
-        if (executor.error) {
-          setError(String(executor.error));
+        if (fieldsExecutor.error) {
+          setError("Could not discover temporal fields");
+          setFieldsLoading(false);
           setLoading(false);
           return;
         }
 
-        var result = executor.result;
+        var result = fieldsExecutor.result;
         if (!result) return;
 
-        // Handle possible wrapping: result might be { result: {...} }
         var payload = result.result || result;
 
         if (payload.error) {
           setError(payload.error);
-        } else if (payload.frames && payload.counts) {
-          setData(payload);
+          setFieldsLoading(false);
+          setLoading(false);
+          return;
+        }
+
+        if (payload.fields && payload.fields.length > 0) {
+          setFields(payload.fields);
+          setFieldsLoading(false);
+
+          // Auto-select: prefer "detections.detections" if present, else first
+          var defaultField = payload.fields[0].path;
+          for (var i = 0; i < payload.fields.length; i++) {
+            if (payload.fields[i].path === "detections.detections") {
+              defaultField = payload.fields[i].path;
+              break;
+            }
+          }
+          setSelectedField(defaultField);
+
+          // Load data for the auto-selected field
+          if (dataExecutor && modalSampleId) {
+            console.log(LOG_PREFIX, "Loading field", defaultField);
+            dataExecutor.execute({
+              sample_id: modalSampleId,
+              field: defaultField,
+            });
+          }
+        } else {
+          setFields([]);
+          setFieldsLoading(false);
+          setLoading(false);
+        }
+      },
+      [
+        fieldsExecutor && fieldsExecutor.isExecuting,
+        fieldsExecutor && fieldsExecutor.result,
+      ],
+    );
+
+    // --- Watch data result ---
+    useEffect(
+      function () {
+        if (!dataExecutor) return;
+        if (dataExecutor.isExecuting) return;
+
+        if (dataExecutor.error) {
+          setError(String(dataExecutor.error));
+          setLoading(false);
+          return;
+        }
+
+        var result = dataExecutor.result;
+        if (!result) return;
+
+        var payload = result.result || result;
+
+        if (payload.error) {
+          setError(payload.error);
+        } else if (payload.frames && payload.values) {
+          // Map "values" to "counts" for SVGChart compatibility
+          setData({
+            frames: payload.frames,
+            counts: payload.values,
+            fps: payload.fps,
+            total_frames: payload.total_frames,
+          });
           console.log(
             LOG_PREFIX,
             "Loaded",
             payload.frames.length,
-            "frames,",
-            payload.total_frames,
-            "total,",
-            payload.fps,
-            "fps",
+            "frames for",
+            payload.field,
           );
         }
         setLoading(false);
       },
-      [executor && executor.isExecuting, executor && executor.result],
+      [
+        dataExecutor && dataExecutor.isExecuting,
+        dataExecutor && dataExecutor.result,
+      ],
     );
 
     // --- Container resize ---
@@ -637,6 +721,22 @@
       };
     }, []);
 
+    // --- Field change handler ---
+    var handleFieldChange = useCallback(
+      function (e) {
+        var newField = e.target.value;
+        setSelectedField(newField);
+        setLoading(true);
+        setError(null);
+        setData(null);
+        if (dataExecutor && modalSampleId) {
+          console.log(LOG_PREFIX, "Switching to field", newField);
+          dataExecutor.execute({ sample_id: modalSampleId, field: newField });
+        }
+      },
+      [modalSampleId, dataExecutor],
+    );
+
     // --- Chart → Video seeking ---
     var fpsForSeek = (data && data.fps) || 30;
 
@@ -646,6 +746,15 @@
       },
       [modalLooker, fpsForSeek],
     );
+
+    // --- Derive Y-axis label from selected field ---
+    var yAxisLabel = "Value";
+    for (var fi = 0; fi < fields.length; fi++) {
+      if (fields[fi].path === selectedField) {
+        yAxisLabel = fields[fi].label;
+        break;
+      }
+    }
 
     // --- Render: Loading ---
     if (loading) {
@@ -668,7 +777,9 @@
         h(
           Typography,
           { variant: "body2", sx: { color: "#8F8D8B" } },
-          "Loading detection counts\u2026",
+          fieldsLoading
+            ? "Discovering fields\u2026"
+            : "Loading " + (selectedField || "data") + "\u2026",
         ),
       );
     }
@@ -715,7 +826,9 @@
         h(
           Typography,
           { sx: { color: "#8F8D8B" } },
-          "No detection data available for this sample",
+          fields.length === 0
+            ? "No plottable fields found for this sample"
+            : "No data available for this field",
         ),
       );
     }
@@ -729,6 +842,61 @@
         ref: containerRef,
         sx: { width: "100%", overflow: "hidden" },
       },
+      // Toolbar with field selector
+      h(
+        "div",
+        {
+          style: {
+            display: "flex",
+            alignItems: "center",
+            gap: "8px",
+            padding: "6px 12px",
+            backgroundColor: "#0D0D0D",
+            borderTopLeftRadius: "6px",
+            borderTopRightRadius: "6px",
+          },
+        },
+        h(
+          "span",
+          {
+            style: {
+              color: "#8F8D8B",
+              fontSize: "12px",
+              fontFamily: "sans-serif",
+            },
+          },
+          "Field",
+        ),
+        h(
+          "select",
+          {
+            value: selectedField,
+            onChange: handleFieldChange,
+            disabled: fieldsLoading || fields.length === 0,
+            style: {
+              backgroundColor: "#18191A",
+              color: "#C1BFBD",
+              border: "1px solid #404040",
+              borderRadius: "4px",
+              padding: "4px 24px 4px 8px",
+              fontSize: "12px",
+              fontFamily: "monospace",
+              outline: "none",
+              cursor: "pointer",
+              minWidth: "180px",
+              appearance: "none",
+              WebkitAppearance: "none",
+              backgroundImage:
+                "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%238F8D8B'/%3E%3C/svg%3E\")",
+              backgroundRepeat: "no-repeat",
+              backgroundPosition: "right 8px center",
+            },
+          },
+          fields.map(function (f) {
+            return h("option", { key: f.path, value: f.path }, f.label);
+          }),
+        ),
+      ),
       // SVG Chart
       h(SVGChart, {
         frames: data.frames,
@@ -737,6 +905,7 @@
         totalFrames: totalFrames,
         onFrameSeek: handleFrameSeek,
         width: containerWidth,
+        yAxisTitle: yAxisLabel,
       }),
       // Status bar
       h(
