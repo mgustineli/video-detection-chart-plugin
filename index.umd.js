@@ -24,6 +24,7 @@
   var memo = React.memo;
 
   var useRecoilValue = window.recoil.useRecoilValue;
+  var useSetRecoilState = window.recoil.useSetRecoilState;
 
   var fos = window.__fos__;
   var foo = window.__foo__;
@@ -54,13 +55,33 @@
     var imaVidPlaying = useRecoilValue(fos.imaVidLookerState("playing"));
     var modalLooker = useRecoilValue(fos.modalLooker);
 
+    // Dynamic group state — controls which sample is displayed
+    var isDynamicGroup = useRecoilValue(fos.isDynamicGroup);
+    var dynamicGroupIndex = useRecoilValue(fos.dynamicGroupCurrentElementIndex);
+    var setDynamicGroupIndex = useSetRecoilState(
+      fos.dynamicGroupCurrentElementIndex,
+    );
+
     var stateRef = useRef({ playing: false, frameNumber: 1 });
     var _s = useState(0);
     var forceUpdate = _s[1];
 
     useEffect(
       function () {
-        // Path 1: ImaVid mode
+        // Path 1: Dynamic group — frame = element index + 1 (1-based)
+        if (isDynamicGroup) {
+          var dgFrame = (dynamicGroupIndex || 0) + 1;
+          stateRef.current = {
+            playing: false,
+            frameNumber: dgFrame,
+          };
+          forceUpdate(function (n) {
+            return n + 1;
+          });
+          return;
+        }
+
+        // Path 2: ImaVid mode
         if (isImaVid) {
           stateRef.current = {
             playing: imaVidPlaying,
@@ -72,8 +93,7 @@
           return;
         }
 
-        // Path 2: Regular video — subscribe to looker state
-        // Use feature detection (constructor.name gets minified in production)
+        // Path 3: Regular video — subscribe to looker state
         if (modalLooker && typeof modalLooker.subscribeToState === "function") {
           stateRef.current = {
             playing: modalLooker.state.playing,
@@ -112,13 +132,16 @@
           };
         }
       },
-      [isImaVid, imaVidFrameNumber, imaVidPlaying, modalLooker],
+      [isDynamicGroup, dynamicGroupIndex, isImaVid, imaVidFrameNumber, imaVidPlaying, modalLooker],
     );
 
     return {
       playing: stateRef.current.playing,
       frameNumber: stateRef.current.frameNumber,
       modalLooker: modalLooker,
+      isImaVid: isImaVid,
+      isDynamicGroup: isDynamicGroup,
+      setDynamicGroupIndex: setDynamicGroupIndex,
     };
   }
 
@@ -131,7 +154,7 @@
   function seekVideoToFrame(frameNumber, modalLooker, fps) {
     if (!modalLooker) return;
 
-    // Seek the actual video element
+    // Seek the actual video element (native video only)
     if (typeof modalLooker.getVideo === "function") {
       var video = modalLooker.getVideo();
       if (video && video.currentTime !== undefined) {
@@ -567,6 +590,9 @@
     var frameNumber = videoState.frameNumber;
     var playing = videoState.playing;
     var modalLooker = videoState.modalLooker;
+    var isImaVid = videoState.isImaVid;
+    var isDynamicGroup = videoState.isDynamicGroup;
+    var setDynamicGroupIndex = videoState.setDynamicGroupIndex;
 
     // --- Operator executors ---
     var fieldsExecutor = null;
@@ -586,9 +612,18 @@
     }
 
     // --- Load fields when sample changes ---
+    // For dynamic groups, data covers the whole group — skip reload on
+    // intra-group navigation (sample ID changes but data is the same).
+    var groupDataLoadedRef = useRef(false);
+
     useEffect(
       function () {
         if (!modalSampleId || !fieldsExecutor) return;
+
+        // Dynamic group: only load once; subsequent sample changes are
+        // from chart-click navigation within the same group.
+        if (isDynamicGroup && groupDataLoadedRef.current) return;
+
         if (modalSampleId === prevSampleRef.current) return;
         prevSampleRef.current = modalSampleId;
 
@@ -691,6 +726,10 @@
             fps: payload.fps,
             total_frames: payload.total_frames,
           });
+          // Mark dynamic group data as loaded to prevent reloads on navigation
+          if (isDynamicGroup) {
+            groupDataLoadedRef.current = true;
+          }
           console.log(
             LOG_PREFIX,
             "Loaded",
@@ -742,9 +781,18 @@
 
     var handleFrameSeek = useCallback(
       function (frame) {
-        seekVideoToFrame(frame, modalLooker, fpsForSeek);
+        if (isDynamicGroup) {
+          // Dynamic group: set element index (0-based) via Recoil
+          setDynamicGroupIndex(frame - 1);
+        } else if (isImaVid) {
+          // ImaVid: also uses dynamic group index
+          setDynamicGroupIndex(frame - 1);
+        } else {
+          // Native video: seek via modalLooker
+          seekVideoToFrame(frame, modalLooker, fpsForSeek);
+        }
       },
-      [modalLooker, fpsForSeek],
+      [isDynamicGroup, isImaVid, setDynamicGroupIndex, modalLooker, fpsForSeek],
     );
 
     // --- Derive Y-axis label from selected field ---

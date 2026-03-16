@@ -21,11 +21,23 @@ from fiftyone import ViewField as F
 LOG_PREFIX = "[VideoDetectionChart]"
 
 
+def _is_dynamic_groups(ctx):
+    """Check if the current view is a dynamically grouped dataset."""
+    return getattr(ctx.view, "_is_dynamic_groups", False)
+
+
 def _get_fields(ctx):
     """Discover plottable frame-level fields (Float, Int, List)."""
-    schema = ctx.view.get_frame_field_schema(
-        flat=True, ftype=(fo.FloatField, fo.IntField, fo.ListField)
-    )
+    ftypes = (fo.FloatField, fo.IntField, fo.ListField)
+
+    if _is_dynamic_groups(ctx):
+        schema = ctx.view.get_field_schema(flat=True, ftype=ftypes)
+    else:
+        schema = ctx.view.get_frame_field_schema(flat=True, ftype=ftypes)
+
+    if not schema:
+        return []
+
     # Filter out sub-paths (e.g., keep "detections.detections" but not
     # "detections.detections.id")
     paths = sorted(schema.keys())
@@ -46,20 +58,52 @@ def _get_fields(ctx):
     return fields
 
 
+def _get_dynamic_group_key(ctx, sample_id):
+    """Resolve the dynamic group key value from a sample ID."""
+    # Find the group_by field from the view stages
+    for stage in ctx.view._stages:
+        if type(stage).__name__ == "GroupBy":
+            group_field = stage._field_or_expr
+            sample = ctx.dataset[sample_id]
+            return sample[group_field]
+    return None
+
+
 def _get_frame_values(ctx, sample_id, field_path):
     """Fetch per-frame values for a given field path."""
-    sample = ctx.dataset[sample_id]
-    fps = sample.metadata.frame_rate if sample.metadata else 30
-    total_frames = sample.metadata.total_frame_count if sample.metadata else 0
+    if _is_dynamic_groups(ctx):
+        # Dynamic groups: each "frame" is a top-level sample in the group
+        group_key = _get_dynamic_group_key(ctx, sample_id)
+        group = ctx.view.get_dynamic_group(group_key)
 
-    field = ctx.view.get_field("frames." + field_path)
-    if isinstance(field, fo.ListField):
-        expr = F("frames[]." + field_path).length()
+        field = ctx.view.get_field(field_path)
+        if isinstance(field, fo.ListField):
+            expr = F(field_path).length()
+        else:
+            expr = field_path
+
+        values = group.values(expr)
+
+        # No frame_number field — generate sequential frame numbers
+        frame_numbers = list(range(1, len(values) + 1))
+
+        # Estimate fps (no metadata on grouped images)
+        fps = 30
+        total_frames = len(frame_numbers)
     else:
-        expr = "frames[]." + field_path
+        # Native video: frame data under frames[]
+        sample = ctx.dataset[sample_id]
+        fps = sample.metadata.frame_rate if sample.metadata else 30
+        total_frames = sample.metadata.total_frame_count if sample.metadata else 0
 
-    view = fov.make_optimized_select_view(ctx.view, [sample_id])
-    frame_numbers, values = view.values(["frames[].frame_number", expr])
+        field = ctx.view.get_field("frames." + field_path)
+        if isinstance(field, fo.ListField):
+            expr = F("frames[]." + field_path).length()
+        else:
+            expr = "frames[]." + field_path
+
+        view = fov.make_optimized_select_view(ctx.view, [sample_id])
+        frame_numbers, values = view.values(["frames[].frame_number", expr])
 
     # Replace None with 0
     values = [v if v is not None else 0 for v in values]
@@ -346,4 +390,5 @@ def register(p):
     p.register(GetTemporalFields)
     p.register(GetFrameValues)
     p.register(GetDetectionCounts)
-    p.register(FrameDataPlot)
+    # FrameDataPlot disabled — Python panel is a reference example only
+    # p.register(FrameDataPlot)
