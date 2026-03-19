@@ -62,6 +62,12 @@
       fos.dynamicGroupCurrentElementIndex,
     );
 
+    // Detect carousel vs pagination mode in dynamic groups
+    var dynamicGroupsViewMode = useRecoilValue(
+      fos.dynamicGroupsViewMode(true),
+    );
+    var isCarousel = isDynamicGroup && dynamicGroupsViewMode === "carousel";
+
     // ImaVid frame setter — directly controls the ImaVid player's current frame
     var setImaVidFrameNumber = useSetRecoilState(
       fos.imaVidLookerState("currentFrameNumber"),
@@ -85,8 +91,8 @@
           return;
         }
 
-        // Path 2: Dynamic group in PAGINATION/CAROUSEL mode
-        if (isDynamicGroup) {
+        // Path 2: Dynamic group in PAGINATION mode (carousel handled by panel)
+        if (isDynamicGroup && !isCarousel) {
           var dgFrame = (dynamicGroupIndex || 0) + 1;
           stateRef.current = {
             playing: false,
@@ -149,7 +155,7 @@
           };
         }
       },
-      [isDynamicGroup, dynamicGroupIndex, isImaVid, imaVidFrameNumber, imaVidPlaying, modalLooker],
+      [isDynamicGroup, isCarousel, dynamicGroupIndex, isImaVid, imaVidFrameNumber, imaVidPlaying, modalLooker],
     );
 
     return {
@@ -158,6 +164,7 @@
       modalLooker: modalLooker,
       isImaVid: isImaVid,
       isDynamicGroup: isDynamicGroup,
+      isCarousel: isCarousel,
       setDynamicGroupIndex: setDynamicGroupIndex,
       setImaVidFrameNumber: setImaVidFrameNumber,
     };
@@ -193,29 +200,32 @@
 
   // ==========================================================
   // Utility: seekImaVidToFrame
-  // Mimics FiftyOne's native seek bar behavior exactly:
-  //   mousedown  → updater({seeking: true})
-  //   mousemove  → updater(state => {currentFrameNumber: N})
-  //   mouseup    → updater({seeking: false})
-  // Three separate updater() calls, each triggering the full
-  // render pipeline (makeUpdate → postProcess → canvas draw).
-  // Using a function form for the frame update matches the
-  // seek bar's seekFn$1 pattern.
+  // Calls drawFrameNoAnimation directly on the ImaVidElement,
+  // matching how FiftyOne's own timeline renderFrame callback
+  // works in ImaVidLookerReact. drawFrameNoAnimation handles
+  // image retrieval from frame store, canvas painting, state
+  // update, and retry if the frame isn't buffered yet.
   // ==========================================================
   function seekImaVidToFrame(frameNumber, modalLooker) {
-    if (!modalLooker || typeof modalLooker.updater !== "function") return;
+    if (!modalLooker) return;
 
-    // Step 1: Enter seeking mode (like seek bar mousedown)
-    modalLooker.updater({ seeking: true });
+    // Access the ImaVidElement via lookerElement.children[0]
+    // This matches ImaVidLooker.element getter: this.lookerElement.children[0]
+    var el =
+      modalLooker.lookerElement &&
+      modalLooker.lookerElement.children &&
+      modalLooker.lookerElement.children[0];
 
-    // Step 2: Set target frame (like seek bar mousemove / seekFn$1)
-    // Use function form to match the native seek bar pattern
-    modalLooker.updater(function () {
-      return { currentFrameNumber: frameNumber };
-    });
+    if (el && typeof el.drawFrameNoAnimation === "function") {
+      el.drawFrameNoAnimation(frameNumber);
+    }
 
-    // Step 3: Exit seeking mode (like seek bar mouseup)
-    modalLooker.updater({ seeking: false });
+    // Pause if playing (stay on the seeked frame)
+    if (modalLooker.state && modalLooker.state.playing) {
+      if (typeof modalLooker.pause === "function") {
+        modalLooker.pause();
+      }
+    }
   }
 
   // ==========================================================
@@ -630,6 +640,9 @@
       modalSampleId = null;
     }
 
+    // --- Carousel navigation: set modal sample to navigate carousel ---
+    var setModalSample = useSetRecoilState(fos.modalSelector);
+
     // --- Video state ---
     var videoState = useVideoState();
     var frameNumber = videoState.frameNumber;
@@ -637,8 +650,16 @@
     var modalLooker = videoState.modalLooker;
     var isImaVid = videoState.isImaVid;
     var isDynamicGroup = videoState.isDynamicGroup;
+    var isCarousel = videoState.isCarousel;
     var setDynamicGroupIndex = videoState.setDynamicGroupIndex;
     var setImaVidFrameNumber = videoState.setImaVidFrameNumber;
+
+    // --- Carousel mode state ---
+    var _carouselFrame = useState(1);
+    var carouselFrame = _carouselFrame[0];
+    var setCarouselFrame = _carouselFrame[1];
+    var sampleIdToFrame = useRef(null);
+    var frameToSampleId = useRef(null);
 
     // --- Operator executors ---
     var fieldsExecutor = null;
@@ -772,6 +793,22 @@
             fps: payload.fps,
             total_frames: payload.total_frames,
           });
+          // Build sample ID ↔ frame number mappings for carousel mode
+          if (payload.sample_ids && payload.sample_ids.length > 0) {
+            var s2f = {};
+            var f2s = {};
+            for (var mi = 0; mi < payload.sample_ids.length; mi++) {
+              var mFrame = payload.frames[mi] || mi + 1;
+              s2f[payload.sample_ids[mi]] = mFrame;
+              f2s[mFrame] = payload.sample_ids[mi];
+            }
+            sampleIdToFrame.current = s2f;
+            frameToSampleId.current = f2s;
+            // Initialize carousel frame from current sample
+            if (isCarousel && modalSampleId && s2f[modalSampleId]) {
+              setCarouselFrame(s2f[modalSampleId]);
+            }
+          }
           // Mark dynamic group data as loaded to prevent reloads on navigation
           if (isDynamicGroup) {
             groupDataLoadedRef.current = true;
@@ -790,6 +827,18 @@
         dataExecutor && dataExecutor.isExecuting,
         dataExecutor && dataExecutor.result,
       ],
+    );
+
+    // --- Carousel → Chart sync: watch modalSampleId changes ---
+    useEffect(
+      function () {
+        if (!isCarousel || !modalSampleId || !sampleIdToFrame.current) return;
+        var frame = sampleIdToFrame.current[modalSampleId];
+        if (frame !== undefined) {
+          setCarouselFrame(frame);
+        }
+      },
+      [modalSampleId, isCarousel],
     );
 
     // --- Container resize ---
@@ -828,8 +877,20 @@
     var handleFrameSeek = useCallback(
       function (frame) {
         if (isDynamicGroup && isImaVid) {
-          // Carousel / Video mode: seek the ImaVid looker directly
+          // Video mode: seek the ImaVid looker directly
           seekImaVidToFrame(frame, modalLooker);
+        } else if (isCarousel) {
+          // Carousel mode: navigate via modalSelector
+          var targetSampleId =
+            frameToSampleId.current && frameToSampleId.current[frame];
+          if (targetSampleId && setModalSample) {
+            setModalSample(function (current) {
+              return current
+                ? Object.assign({}, current, { id: targetSampleId })
+                : current;
+            });
+          }
+          setCarouselFrame(frame);
         } else if (isDynamicGroup) {
           // Pagination mode: navigate via group element index
           setDynamicGroupIndex(frame - 1);
@@ -841,7 +902,7 @@
           seekVideoToFrame(frame, modalLooker, fpsForSeek);
         }
       },
-      [isDynamicGroup, isImaVid, setDynamicGroupIndex, modalLooker, fpsForSeek],
+      [isDynamicGroup, isCarousel, isImaVid, setDynamicGroupIndex, setModalSample, modalLooker, fpsForSeek],
     );
 
     // --- Derive Y-axis label from selected field ---
@@ -932,6 +993,7 @@
 
     // --- Render: Chart ---
     var totalFrames = data.total_frames || data.frames.length;
+    var effectiveFrame = isCarousel ? carouselFrame : frameNumber;
 
     return h(
       Box,
@@ -998,7 +1060,7 @@
       h(SVGChart, {
         frames: data.frames,
         counts: data.counts,
-        currentFrame: frameNumber,
+        currentFrame: effectiveFrame,
         totalFrames: totalFrames,
         onFrameSeek: handleFrameSeek,
         width: containerWidth,
@@ -1022,7 +1084,7 @@
         h(
           Typography,
           { variant: "body2", sx: { color: "#8F8D8B", fontFamily: "monospace" } },
-          "Frame " + frameNumber + " / " + totalFrames,
+          "Frame " + effectiveFrame + " / " + totalFrames,
         ),
         h(
           Typography,

@@ -90,6 +90,7 @@ def _get_frame_values(ctx, sample_id, field_path):
         # Estimate fps (no metadata on grouped images)
         fps = 30
         total_frames = len(frame_numbers)
+        sample_ids = [str(s) for s in group.values("id")]
     else:
         # Native video: frame data under frames[]
         sample = ctx.dataset[sample_id]
@@ -104,6 +105,7 @@ def _get_frame_values(ctx, sample_id, field_path):
 
         view = fov.make_optimized_select_view(ctx.view, [sample_id])
         frame_numbers, values = view.values(["frames[].frame_number", expr])
+        sample_ids = None
 
     # Replace None with 0
     values = [v if v is not None else 0 for v in values]
@@ -114,6 +116,7 @@ def _get_frame_values(ctx, sample_id, field_path):
         "fps": fps,
         "total_frames": total_frames,
         "field": field_path,
+        "sample_ids": sample_ids,
     }
 
 
