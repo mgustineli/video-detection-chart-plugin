@@ -10,6 +10,9 @@ __pycache__/
 # Local dev scripts
 start_foe_dev.sh
 
+# Plugin zip (built locally for deployment testing)
+*.zip
+
 # Environment variables and credentials
 .env
 gcp-credentials.json
