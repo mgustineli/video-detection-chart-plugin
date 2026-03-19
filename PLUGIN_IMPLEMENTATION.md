@@ -12,28 +12,28 @@ Dynamic groups support all three navigation modes: **pagination**, **carousel**,
 ## Architecture
 
 ```
-+------------------------------------------------------------------+
-| FiftyOne App (Browser)                                           |
-|                                                                  |
-| +-----------------+   Recoil atoms    +------------------------+ |
-| | Video Player    | -(modalLooker)->  | JS Panel               | |
-| | / ImaVid        | -(imaVidState)->  | (index.umd.js)         | |
-| | / Carousel      | -(modalSampleId)> |                        | |
-| |                 |                   | - useVideoState()      | |
-| |                 | <- getVideo() --- | - SVGChart             | |
-| |                 | <- drawFrame() -- | - Field selector       | |
-| |                 | <- modalSelector  | - Status bar           | |
-| +-----------------+                   +------------+-----------+ |
-|                                                    |             |
-|                                          useOperatorExecutor()   |
-|                                                    |             |
-| +--------------------------------------------------v-----------+ |
-| | Python Operators (__init__.py)                                | |
-| | - GetTemporalFields: discovers plottable fields              | |
-| | - GetFrameValues: per-frame data + sample_ids                | |
-| | - GetDetectionCounts: legacy wrapper                         | |
-| +--------------------------------------------------------------+ |
-+------------------------------------------------------------------+
+┌──────────────────────────────────────────────────────────────────┐
+│ FiftyOne App (Browser)                                           │
+│                                                                  │
+│ ┌─────────────────┐   Recoil atoms    ┌────────────────────────┐ │
+│ │ Video Player    │ ─(modalLooker)──▶ │ JS Panel               │ │
+│ │ / ImaVid        │ ─(imaVidState)──▶ │ (index.umd.js)         │ │
+│ │ / Carousel      │ ─(modalSampleId)▶ │                        │ │
+│ │                 │                   │ ── useVideoState()      │ │
+│ │                 │ ◀── getVideo() ── │ ── SVGChart             │ │
+│ │                 │ ◀── drawFrame() ─ │ ── Field selector       │ │
+│ │                 │ ◀── modalSelector │ ── Status bar           │ │
+│ └─────────────────┘                   └────────────┬───────────┘ │
+│                                                    │             │
+│                                          useOperatorExecutor()   │
+│                                                    │             │
+│ ┌──────────────────────────────────────────────────▼───────────┐ │
+│ │ Python Operators (__init__.py)                                │ │
+│ │ ── GetTemporalFields: discovers plottable fields             │ │
+│ │ ── GetFrameValues: per-frame data + sample_ids               │ │
+│ │ ── GetDetectionCounts: legacy wrapper                        │ │
+│ └──────────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ## File Structure
