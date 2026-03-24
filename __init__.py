@@ -32,8 +32,10 @@ def _get_fields(ctx):
 
     if _is_dynamic_groups(ctx):
         schema = ctx.view.get_field_schema(flat=True, ftype=ftypes)
+        full_schema = ctx.view.get_field_schema(flat=True)
     else:
         schema = ctx.view.get_frame_field_schema(flat=True, ftype=ftypes)
+        full_schema = ctx.view.get_frame_field_schema(flat=True)
 
     if not schema:
         return []
@@ -49,11 +51,17 @@ def _get_fields(ctx):
     for path in top_paths:
         field = schema[path]
         if isinstance(field, fo.ListField):
-            fields.append({"path": path, "type": "list", "label": f"{path} (count)"})
+            has_labels = (path + ".label") in full_schema
+            fields.append({
+                "path": path,
+                "type": "list",
+                "label": f"{path} (count)",
+                "has_labels": has_labels,
+            })
         elif isinstance(field, fo.FloatField):
-            fields.append({"path": path, "type": "float", "label": path})
+            fields.append({"path": path, "type": "float", "label": path, "has_labels": False})
         elif isinstance(field, fo.IntField):
-            fields.append({"path": path, "type": "int", "label": path})
+            fields.append({"path": path, "type": "int", "label": path, "has_labels": False})
 
     return fields
 
@@ -120,6 +128,65 @@ def _get_frame_values(ctx, sample_id, field_path):
     }
 
 
+def _get_label_timeline(ctx, sample_id, field_path):
+    """Fetch per-frame label data for a given field path (swim lane heatmap)."""
+    label_expr = field_path + ".label"
+
+    if _is_dynamic_groups(ctx):
+        group_key = _get_dynamic_group_key(ctx, sample_id)
+        group = ctx.view.get_dynamic_group(group_key)
+
+        label_lists = group.values(F(label_expr))
+        frame_numbers = list(range(1, len(label_lists) + 1))
+        fps = 30
+        total_frames = len(frame_numbers)
+        sample_ids = [str(s) for s in group.values("id")]
+    else:
+        sample = ctx.dataset[sample_id]
+        fps = sample.metadata.frame_rate if sample.metadata else 30
+        total_frames = sample.metadata.total_frame_count if sample.metadata else 0
+
+        view = fov.make_optimized_select_view(ctx.view, [sample_id])
+        frame_numbers, label_lists = view.values(
+            ["frames[].frame_number", "frames[]." + label_expr]
+        )
+        sample_ids = None
+
+    # Count labels across all frames to get unique labels sorted by total count
+    label_counts = {}
+    for frame_labels in label_lists:
+        if frame_labels:
+            for label in frame_labels:
+                if label is not None:
+                    label_counts[label] = label_counts.get(label, 0) + 1
+
+    # Sort labels by total count descending
+    sorted_labels = sorted(
+        label_counts.keys(), key=lambda l: label_counts[l], reverse=True
+    )
+
+    # Build timeline: per-label count arrays
+    timeline = {}
+    for label in sorted_labels:
+        timeline[label] = [0] * len(frame_numbers)
+
+    for i, frame_labels in enumerate(label_lists):
+        if frame_labels:
+            for label in frame_labels:
+                if label is not None and label in timeline:
+                    timeline[label][i] += 1
+
+    return {
+        "frames": frame_numbers,
+        "labels": sorted_labels,
+        "timeline": timeline,
+        "fps": fps,
+        "total_frames": total_frames,
+        "field": field_path,
+        "sample_ids": sample_ids,
+    }
+
+
 class GetTemporalFields(foo.Operator):
     """Discovers plottable frame-level fields for the current dataset."""
 
@@ -160,20 +227,30 @@ class GetFrameValues(foo.Operator):
         inputs = types.Object()
         inputs.str("sample_id", required=True)
         inputs.str("field", default="detections.detections")
+        inputs.str("mode", default="count")
         return types.Property(inputs)
 
     def execute(self, ctx):
         sample_id = ctx.params.get("sample_id")
         field_path = ctx.params.get("field", "detections.detections")
+        mode = ctx.params.get("mode", "count")
         if not sample_id:
             return {}
 
         try:
-            result = _get_frame_values(ctx, sample_id, field_path)
-            print(
-                f"{LOG_PREFIX} Loaded {len(result['frames'])} frames"
-                f" for field '{field_path}'"
-            )
+            if mode == "labels":
+                result = _get_label_timeline(ctx, sample_id, field_path)
+                print(
+                    f"{LOG_PREFIX} Loaded label timeline for '{field_path}'"
+                    f" ({len(result['labels'])} labels,"
+                    f" {len(result['frames'])} frames)"
+                )
+            else:
+                result = _get_frame_values(ctx, sample_id, field_path)
+                print(
+                    f"{LOG_PREFIX} Loaded {len(result['frames'])} frames"
+                    f" for field '{field_path}'"
+                )
             return result
         except Exception as e:
             print(f"{LOG_PREFIX} Error loading field '{field_path}': {e}")

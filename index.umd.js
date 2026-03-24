@@ -44,6 +44,36 @@
   var CHART_HEIGHT = 350;
   var MARGIN = { top: 35, right: 30, bottom: 50, left: 65 };
 
+  // --- Label Timeline Constants ---
+  var LT_MARGIN = { top: 35, right: 30, bottom: 30, left: 140 };
+  var LT_ROW_HEIGHT = 14;
+  var LT_ROW_GAP = 1;
+  var LT_DEFAULT_MAX_LABELS = 15;
+
+  var LABEL_COLORS = [
+    "#FF6D04", "#4FC3F7", "#81C784", "#FFB74D", "#BA68C8",
+    "#4DD0E1", "#AED581", "#FF8A65", "#9575CD", "#FFD54F",
+    "#F06292", "#26A69A", "#DCE775", "#7986CB", "#A1887F",
+    "#90A4AE", "#CE93D8", "#80CBC4", "#FFAB91", "#80DEEA",
+  ];
+
+  function hashString(str) {
+    var hash = 5381;
+    for (var i = 0; i < str.length; i++) {
+      hash = ((hash << 5) + hash) + str.charCodeAt(i);
+      hash = hash & hash;
+    }
+    return Math.abs(hash);
+  }
+
+  function labelColor(label) {
+    return LABEL_COLORS[hashString(label) % LABEL_COLORS.length];
+  }
+
+  function chartKey(field, type) {
+    return field + ":" + (type || "count");
+  }
+
   // ==========================================================
   // Hook: useVideoState
   // Reads video playback state from the modal looker.
@@ -239,8 +269,10 @@
   function saveChartFields(datasetName, charts) {
     if (!datasetName) return;
     try {
-      var fieldPaths = charts.map(function (c) { return c.field; });
-      localStorage.setItem(LS_PREFIX + datasetName, JSON.stringify(fieldPaths));
+      var entries = charts.map(function (c) {
+        return { field: c.field, type: c.type || "count" };
+      });
+      localStorage.setItem(LS_PREFIX + datasetName, JSON.stringify(entries));
     } catch (e) { /* quota errors etc */ }
   }
 
@@ -248,7 +280,16 @@
     if (!datasetName) return null;
     try {
       var raw = localStorage.getItem(LS_PREFIX + datasetName);
-      return raw ? JSON.parse(raw) : null;
+      if (!raw) return null;
+      var parsed = JSON.parse(raw);
+      if (!parsed || !parsed.length) return null;
+      // Migration: old format was string array of field paths
+      if (typeof parsed[0] === "string") {
+        return parsed.map(function (f) {
+          return { field: f, type: "count" };
+        });
+      }
+      return parsed;
     } catch (e) { return null; }
   }
 
@@ -618,6 +659,423 @@
   }
 
   // ==========================================================
+  // Component: LabelTimelineChart
+  // Swim lane heatmap showing per-label detection counts.
+  // ==========================================================
+  function LabelTimelineChart(props) {
+    var frames = props.frames;
+    var labels = props.labels;
+    var timeline = props.timeline;
+    var currentFrame = props.currentFrame;
+    var totalFrames = props.totalFrames;
+    var onFrameSeek = props.onFrameSeek;
+    var width = props.width;
+
+    var _expanded = useState(false);
+    var expanded = _expanded[0];
+    var setExpanded = _expanded[1];
+
+    var _hoverInfo = useState(null);
+    var hoverInfo = _hoverInfo[0];
+    var setHoverInfo = _hoverInfo[1];
+
+    var svgRef = useRef(null);
+    var wrapRef = useRef(null);
+
+    if (!labels || labels.length === 0) {
+      return h(
+        Box,
+        {
+          sx: {
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            height: 200,
+            bgcolor: "#18191A",
+          },
+        },
+        h(Typography, { sx: { color: "#8F8D8B" } }, "No label data available"),
+      );
+    }
+
+    var visibleLabels = expanded ? labels : labels.slice(0, LT_DEFAULT_MAX_LABELS);
+    var hiddenCount = labels.length - LT_DEFAULT_MAX_LABELS;
+    var showExpander = !expanded && hiddenCount > 0;
+
+    var plotWidth = width - LT_MARGIN.left - LT_MARGIN.right;
+    var heatmapHeight = visibleLabels.length * (LT_ROW_HEIGHT + LT_ROW_GAP);
+    var expanderHeight = showExpander ? 24 : 0;
+    var chartHeight = LT_MARGIN.top + heatmapHeight + expanderHeight + LT_MARGIN.bottom;
+
+    if (plotWidth <= 0) return null;
+
+    // Find global max count for opacity scaling
+    var globalMax = 1;
+    for (var li = 0; li < visibleLabels.length; li++) {
+      var arr = timeline[visibleLabels[li]];
+      if (arr) {
+        for (var fi = 0; fi < arr.length; fi++) {
+          if (arr[fi] > globalMax) globalMax = arr[fi];
+        }
+      }
+    }
+
+    // Frame binning: when plotWidth / totalFrames < 2px
+    var binSize = 1;
+    var binnedFrameCount = frames.length;
+    if (frames.length > 0 && plotWidth / frames.length < 2) {
+      binSize = Math.ceil(frames.length / (plotWidth / 2));
+      binnedFrameCount = Math.ceil(frames.length / binSize);
+    }
+
+    // Bin timeline data if needed
+    var displayTimeline = timeline;
+    if (binSize > 1) {
+      displayTimeline = {};
+      for (var bi = 0; bi < visibleLabels.length; bi++) {
+        var lbl = visibleLabels[bi];
+        var src = timeline[lbl] || [];
+        var binned = [];
+        for (var bj = 0; bj < src.length; bj += binSize) {
+          var maxVal = 0;
+          for (var bk = bj; bk < Math.min(bj + binSize, src.length); bk++) {
+            if (src[bk] > maxVal) maxVal = src[bk];
+          }
+          binned.push(maxVal);
+        }
+        displayTimeline[lbl] = binned;
+      }
+    }
+
+    var cellWidth = plotWidth / binnedFrameCount;
+
+    // Scale function
+    var xScale = function (frame) {
+      return LT_MARGIN.left + ((frame - 1) / Math.max(totalFrames - 1, 1)) * plotWidth;
+    };
+
+    var frameFromMouseX = function (clientX, svgEl) {
+      var rect = svgEl.getBoundingClientRect();
+      var clickX = clientX - rect.left;
+      if (clickX < LT_MARGIN.left) clickX = LT_MARGIN.left;
+      if (clickX > width - LT_MARGIN.right) clickX = width - LT_MARGIN.right;
+      var fraction = (clickX - LT_MARGIN.left) / plotWidth;
+      var frame = Math.round(fraction * (totalFrames - 1)) + 1;
+      return Math.max(1, Math.min(totalFrames, frame));
+    };
+
+    // Mouse handlers for click + drag seeking
+    var handleMouseDown = useCallback(
+      function (e) {
+        if (!svgRef.current) return;
+        e.preventDefault();
+        var frame = frameFromMouseX(e.clientX, svgRef.current);
+        onFrameSeek(frame);
+        var svg = svgRef.current;
+        var onMove = function (ev) {
+          onFrameSeek(frameFromMouseX(ev.clientX, svg));
+        };
+        var onUp = function () {
+          document.removeEventListener("mousemove", onMove);
+          document.removeEventListener("mouseup", onUp);
+        };
+        document.addEventListener("mousemove", onMove);
+        document.addEventListener("mouseup", onUp);
+      },
+      [onFrameSeek, totalFrames, width],
+    );
+
+    // Hover handler
+    var handleHover = function (e) {
+      if (!svgRef.current || !wrapRef.current) return;
+      var wrapRect = wrapRef.current.getBoundingClientRect();
+      var svgRect = svgRef.current.getBoundingClientRect();
+      var mouseX = e.clientX - svgRect.left;
+      var binIdx = Math.max(
+        0,
+        Math.min(binnedFrameCount - 1, Math.floor((mouseX - LT_MARGIN.left) / cellWidth)),
+      );
+
+      var entries = [];
+      for (var ti = 0; ti < visibleLabels.length; ti++) {
+        var hl = visibleLabels[ti];
+        var val = displayTimeline[hl] ? (displayTimeline[hl][binIdx] || 0) : 0;
+        if (val > 0) entries.push({ label: hl, count: val, color: labelColor(hl) });
+      }
+
+      if (entries.length === 0) {
+        setHoverInfo(null);
+        return;
+      }
+
+      var frameStart = binIdx * binSize + 1;
+      var frameEnd = Math.min((binIdx + 1) * binSize, totalFrames);
+      var frameLabel =
+        binSize > 1
+          ? "Frames " + frameStart + "\u2013" + frameEnd
+          : "Frame " + frameFromMouseX(e.clientX, svgRef.current);
+
+      setHoverInfo({
+        x: e.clientX,
+        y: e.clientY,
+        frameLabel: frameLabel,
+        entries: entries,
+      });
+    };
+
+    var handleMouseLeave = function () {
+      setHoverInfo(null);
+    };
+
+    // Build SVG children
+    var children = [];
+
+    // Background
+    children.push(
+      h("rect", {
+        key: "bg",
+        width: width,
+        height: chartHeight,
+        fill: "#18191A",
+        rx: 6,
+      }),
+    );
+
+    // Heatmap cells
+    for (var ri = 0; ri < visibleLabels.length; ri++) {
+      var lbl = visibleLabels[ri];
+      var color = labelColor(lbl);
+      var rowY = LT_MARGIN.top + ri * (LT_ROW_HEIGHT + LT_ROW_GAP);
+      var vals = displayTimeline[lbl] || [];
+
+      for (var ci = 0; ci < vals.length; ci++) {
+        if (vals[ci] === 0) continue;
+        var opacity = 0.2 + 0.8 * (vals[ci] / globalMax);
+        children.push(
+          h("rect", {
+            key: "c-" + ri + "-" + ci,
+            x: LT_MARGIN.left + ci * cellWidth,
+            y: rowY,
+            width: Math.max(cellWidth - 0.5, 1),
+            height: LT_ROW_HEIGHT,
+            fill: color,
+            opacity: opacity,
+          }),
+        );
+      }
+
+      // Color swatch
+      children.push(
+        h("rect", {
+          key: "sw-" + ri,
+          x: LT_MARGIN.left - 18,
+          y: rowY + 3,
+          width: 8,
+          height: 8,
+          fill: color,
+          rx: 1,
+        }),
+      );
+
+      // Label name (truncated with SVG title tooltip)
+      var displayName = lbl.length > 16 ? lbl.substring(0, 15) + "\u2026" : lbl;
+      children.push(
+        h(
+          "text",
+          {
+            key: "ln-" + ri,
+            x: LT_MARGIN.left - 22,
+            y: rowY + LT_ROW_HEIGHT / 2 + 4,
+            fill: "#C1BFBD",
+            fontSize: 11,
+            textAnchor: "end",
+            fontFamily: "monospace",
+          },
+          lbl.length > 16 ? h("title", null, lbl) : null,
+          displayName,
+        ),
+      );
+    }
+
+    // Frame indicator (blue vertical line)
+    if (currentFrame >= 1 && currentFrame <= totalFrames) {
+      var cx = xScale(currentFrame);
+      children.push(
+        h("line", {
+          key: "vline",
+          x1: cx,
+          y1: LT_MARGIN.top,
+          x2: cx,
+          y2: LT_MARGIN.top + heatmapHeight,
+          stroke: "#86B5F6",
+          strokeWidth: 2,
+          opacity: 0.85,
+        }),
+      );
+      children.push(
+        h(
+          "text",
+          {
+            key: "vlabel",
+            x: cx,
+            y: LT_MARGIN.top - 10,
+            fill: "#86B5F6",
+            fontSize: 14,
+            fontWeight: "bold",
+            textAnchor: "middle",
+            fontFamily: "monospace",
+          },
+          "Frame " + currentFrame,
+        ),
+      );
+    }
+
+    // X axis ticks
+    var xTickStep = Math.max(1, Math.floor(totalFrames / 6));
+    var xAxisY = LT_MARGIN.top + heatmapHeight + expanderHeight;
+    var xTicks = [];
+    for (var xt = 1; xt <= totalFrames; xt += xTickStep) xTicks.push(xt);
+    if (xTicks[xTicks.length - 1] !== totalFrames) xTicks.push(totalFrames);
+    for (var xi = 0; xi < xTicks.length; xi++) {
+      children.push(
+        h(
+          "text",
+          {
+            key: "xl-" + xi,
+            x: xScale(xTicks[xi]),
+            y: xAxisY + 16,
+            fill: "#8F8D8B",
+            fontSize: 11,
+            textAnchor: "middle",
+            fontFamily: "monospace",
+          },
+          xTicks[xi],
+        ),
+      );
+    }
+
+    // "Show N more…" expander
+    if (showExpander) {
+      children.push(
+        h(
+          "text",
+          {
+            key: "expander",
+            x: width / 2,
+            y: LT_MARGIN.top + heatmapHeight + 18,
+            fill: "#4FC3F7",
+            fontSize: 12,
+            textAnchor: "middle",
+            fontFamily: "sans-serif",
+            cursor: "pointer",
+            onClick: function () {
+              setExpanded(true);
+            },
+          },
+          "Show " + hiddenCount + " more\u2026 \u25BC",
+        ),
+      );
+    }
+
+    // Transparent overlay for click/drag + hover
+    children.push(
+      h("rect", {
+        key: "overlay",
+        x: LT_MARGIN.left,
+        y: LT_MARGIN.top,
+        width: plotWidth,
+        height: heatmapHeight,
+        fill: "transparent",
+        cursor: "crosshair",
+        onMouseDown: handleMouseDown,
+        onMouseMove: handleHover,
+        onMouseLeave: handleMouseLeave,
+      }),
+    );
+
+    // Tooltip — rendered via portal to body so it floats above all charts
+    var tooltip = null;
+    if (hoverInfo) {
+      var tipEl = h(
+        "div",
+        {
+          style: {
+            position: "fixed",
+            left: hoverInfo.x + 12 + "px",
+            top: hoverInfo.y - 10 + "px",
+            backgroundColor: "rgba(0,0,0,0.92)",
+            border: "1px solid #404040",
+            borderRadius: "4px",
+            padding: "6px 10px",
+            pointerEvents: "none",
+            zIndex: 99999,
+            whiteSpace: "nowrap",
+          },
+        },
+        h(
+          "div",
+          {
+            style: {
+              color: "#86B5F6",
+              fontSize: "12px",
+              fontFamily: "monospace",
+              marginBottom: "4px",
+            },
+          },
+          hoverInfo.frameLabel,
+        ),
+        hoverInfo.entries.map(function (entry, i) {
+          return h(
+            "div",
+            {
+              key: i,
+              style: {
+                display: "flex",
+                alignItems: "center",
+                gap: "6px",
+                fontSize: "11px",
+                fontFamily: "monospace",
+              },
+            },
+            h("span", {
+              style: {
+                display: "inline-block",
+                width: "8px",
+                height: "8px",
+                backgroundColor: entry.color,
+                borderRadius: "1px",
+                flexShrink: 0,
+              },
+            }),
+            h(
+              "span",
+              { style: { color: "#C1BFBD" } },
+              entry.count + "\u00D7 " + entry.label,
+            ),
+          );
+        }),
+      );
+      tooltip = window.ReactDOM.createPortal(tipEl, document.body);
+    }
+
+    return h(
+      "div",
+      { ref: wrapRef, style: { position: "relative" } },
+      h(
+        "svg",
+        {
+          ref: svgRef,
+          width: width,
+          height: chartHeight,
+          style: { display: "block", userSelect: "none" },
+        },
+        children,
+      ),
+      tooltip,
+    );
+  }
+
+  // ==========================================================
   // Component: ChartCard
   // Wraps a single chart with header (label + action buttons)
   // and handles loading/error/data states.
@@ -636,6 +1094,7 @@
 
   function ChartCard(props) {
     var field = props.field;
+    var chartType = props.chartType || "count";
     var label = props.label;
     var data = props.data;
     var loading = props.loading;
@@ -650,6 +1109,8 @@
     var onFrameSeek = props.onFrameSeek;
     var width = props.width;
 
+    var placeholderHeight = chartType === "labels" ? 200 : CHART_HEIGHT;
+
     var body;
     if (loading) {
       body = h(
@@ -660,7 +1121,7 @@
             flexDirection: "column",
             alignItems: "center",
             justifyContent: "center",
-            height: CHART_HEIGHT,
+            height: placeholderHeight,
             bgcolor: "#18191A",
             gap: 1,
           },
@@ -681,7 +1142,7 @@
             flexDirection: "column",
             alignItems: "center",
             justifyContent: "center",
-            height: CHART_HEIGHT,
+            height: placeholderHeight,
             bgcolor: "#18191A",
             gap: 1,
           },
@@ -692,6 +1153,16 @@
           "Error: " + error,
         ),
       );
+    } else if (chartType === "labels" && data && data.timeline) {
+      body = h(LabelTimelineChart, {
+        frames: data.frames,
+        labels: data.labels,
+        timeline: data.timeline,
+        currentFrame: currentFrame,
+        totalFrames: totalFrames,
+        onFrameSeek: onFrameSeek,
+        width: width,
+      });
     } else if (data && data.frames && data.frames.length > 0) {
       body = h(SVGChart, {
         frames: data.frames,
@@ -710,7 +1181,7 @@
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
-            height: CHART_HEIGHT,
+            height: placeholderHeight,
             bgcolor: "#18191A",
           },
         },
@@ -897,17 +1368,22 @@
       if (loadQueueRef.current.length === 0) return;
       if (!dataExecutor || !modalSampleId) return;
 
-      var field = loadQueueRef.current.shift();
-      loadingFieldRef.current = field;
+      var entry = loadQueueRef.current.shift();
+      var key = chartKey(entry.field, entry.type);
+      loadingFieldRef.current = key;
 
       setChartStatus(function (prev) {
         var next = Object.assign({}, prev);
-        next[field] = { loading: true, error: null };
+        next[key] = { loading: true, error: null };
         return next;
       });
 
-      console.log(LOG_PREFIX, "Loading field", field);
-      dataExecutor.execute({ sample_id: modalSampleId, field: field });
+      console.log(LOG_PREFIX, "Loading field", entry.field, "mode", entry.type);
+      dataExecutor.execute({
+        sample_id: modalSampleId,
+        field: entry.field,
+        mode: entry.type || "count",
+      });
     };
     var processQueueRef = useRef(processQueue);
     processQueueRef.current = processQueue;
@@ -979,58 +1455,74 @@
         }
 
         var availablePaths = payload.fields.map(function (f) { return f.path; });
-        var initialFields = null;
+        var initialEntries = null;
 
         // 1. If we already have charts (sample change), keep them filtered
         if (charts.length > 0) {
-          var surviving = charts
-            .map(function (c) { return c.field; })
-            .filter(function (f) { return availablePaths.indexOf(f) >= 0; });
+          var surviving = charts.filter(function (c) {
+            return availablePaths.indexOf(c.field) >= 0;
+          });
           if (surviving.length > 0) {
-            initialFields = surviving;
+            initialEntries = surviving.map(function (c) {
+              return { field: c.field, type: c.type || "count" };
+            });
           }
         }
 
         // 2. Try localStorage
-        if (!initialFields) {
+        if (!initialEntries) {
           var saved = loadChartFields(datasetNameRef.current);
           if (saved && saved.length > 0) {
-            var valid = saved.filter(function (f) {
-              return availablePaths.indexOf(f) >= 0;
+            var valid = saved.filter(function (e) {
+              return availablePaths.indexOf(e.field) >= 0;
             });
             if (valid.length > 0) {
-              initialFields = valid;
+              initialEntries = valid;
             }
           }
         }
 
-        // 3. Default: prefer "detections.detections" if present
-        if (!initialFields) {
-          var defaultField = payload.fields[0].path;
+        // 3. Default: prefer labels type for first label-capable field
+        if (!initialEntries) {
+          var defaultEntry = null;
           for (var i = 0; i < payload.fields.length; i++) {
-            if (payload.fields[i].path === "detections.detections") {
-              defaultField = payload.fields[i].path;
+            if (payload.fields[i].path === "detections.detections" && payload.fields[i].has_labels) {
+              defaultEntry = { field: "detections.detections", type: "labels" };
               break;
             }
           }
-          initialFields = [defaultField];
+          if (!defaultEntry) {
+            for (var i = 0; i < payload.fields.length; i++) {
+              if (payload.fields[i].has_labels) {
+                defaultEntry = { field: payload.fields[i].path, type: "labels" };
+                break;
+              }
+            }
+          }
+          if (!defaultEntry) {
+            defaultEntry = { field: payload.fields[0].path, type: "count" };
+          }
+          initialEntries = [defaultEntry];
         }
 
         // Create chart entries
         nextIdRef.current = 1;
-        var newCharts = initialFields.map(function (f) {
-          return { id: nextIdRef.current++, field: f };
+        var newCharts = initialEntries.map(function (e) {
+          return { id: nextIdRef.current++, field: e.field, type: e.type || "count" };
         });
         setCharts(newCharts);
 
         // Initialize status and queue all for loading
         var statusInit = {};
-        for (var si = 0; si < initialFields.length; si++) {
-          statusInit[initialFields[si]] = { loading: true, error: null };
+        for (var si = 0; si < initialEntries.length; si++) {
+          var sKey = chartKey(initialEntries[si].field, initialEntries[si].type);
+          statusInit[sKey] = { loading: true, error: null };
         }
         setChartStatus(statusInit);
 
-        loadQueueRef.current = initialFields.slice();
+        loadQueueRef.current = initialEntries.map(function (e) {
+          return { field: e.field, type: e.type || "count" };
+        });
         setTimeout(function () {
           processQueueRef.current();
         }, 0);
@@ -1051,32 +1543,48 @@
         if (!result || result === processedResultRef.current) return;
         processedResultRef.current = result;
 
-        var field = loadingFieldRef.current;
-        if (!field) return;
+        var key = loadingFieldRef.current;
+        if (!key) return;
 
         var payload = result.result || result;
+        var stashOk = false;
 
         if (dataExecutor.error) {
           setChartStatus(function (prev) {
             var next = Object.assign({}, prev);
-            next[field] = { loading: false, error: String(dataExecutor.error) };
+            next[key] = { loading: false, error: String(dataExecutor.error) };
             return next;
           });
         } else if (payload.error) {
           setChartStatus(function (prev) {
             var next = Object.assign({}, prev);
-            next[field] = { loading: false, error: payload.error };
+            next[key] = { loading: false, error: payload.error };
             return next;
           });
+        } else if (payload.timeline) {
+          // Label timeline data
+          dataStoreRef.current[key] = {
+            frames: payload.frames,
+            labels: payload.labels,
+            timeline: payload.timeline,
+            fps: payload.fps,
+            total_frames: payload.total_frames,
+          };
+          stashOk = true;
+          console.log(LOG_PREFIX, "Loaded label timeline for", key);
         } else if (payload.frames && payload.values) {
-          // Stash data in cache
-          dataStoreRef.current[field] = {
+          // Count data
+          dataStoreRef.current[key] = {
             frames: payload.frames,
             counts: payload.values,
             fps: payload.fps,
             total_frames: payload.total_frames,
           };
+          stashOk = true;
+          console.log(LOG_PREFIX, "Loaded", payload.frames.length, "frames for", key);
+        }
 
+        if (stashOk) {
           // Build sample ID ↔ frame number mappings (from first chart with sample_ids)
           if (
             payload.sample_ids &&
@@ -1092,30 +1600,20 @@
             }
             sampleIdToFrame.current = s2f;
             frameToSampleId.current = f2s;
-            // Initialize carousel frame from current sample
             if (isCarousel && modalSampleId && s2f[modalSampleId]) {
               setCarouselFrame(s2f[modalSampleId]);
             }
           }
 
-          // Mark dynamic group data as loaded to prevent reloads on navigation
           if (isDynamicGroup) {
             groupDataLoadedRef.current = true;
           }
 
           setChartStatus(function (prev) {
             var next = Object.assign({}, prev);
-            next[field] = { loading: false, error: null };
+            next[key] = { loading: false, error: null };
             return next;
           });
-
-          console.log(
-            LOG_PREFIX,
-            "Loaded",
-            payload.frames.length,
-            "frames for",
-            field,
-          );
         }
 
         loadingFieldRef.current = null;
@@ -1170,27 +1668,32 @@
     // --- Add chart handler ---
     var handleAddChart = useCallback(
       function (e) {
-        var newField = e.target.value;
-        if (!newField) return;
+        var rawValue = e.target.value;
+        if (!rawValue) return;
         e.target.value = "";
 
+        var lastColon = rawValue.lastIndexOf(":");
+        var newField = rawValue.substring(0, lastColon);
+        var newType = rawValue.substring(lastColon + 1);
+        var key = chartKey(newField, newType);
+
         setCharts(function (prev) {
-          return prev.concat([{ id: nextIdRef.current++, field: newField }]);
+          return prev.concat([{ id: nextIdRef.current++, field: newField, type: newType }]);
         });
 
-        if (dataStoreRef.current[newField]) {
+        if (dataStoreRef.current[key]) {
           // Already cached — mark as loaded
           setChartStatus(function (prev) {
             var next = Object.assign({}, prev);
-            next[newField] = { loading: false, error: null };
+            next[key] = { loading: false, error: null };
             return next;
           });
         } else {
           // Queue for loading
-          loadQueueRef.current.push(newField);
+          loadQueueRef.current.push({ field: newField, type: newType });
           setChartStatus(function (prev) {
             var next = Object.assign({}, prev);
-            next[newField] = { loading: true, error: null };
+            next[key] = { loading: true, error: null };
             return next;
           });
           setTimeout(function () {
@@ -1236,7 +1739,7 @@
     // --- Chart → Video seeking ---
     var fpsForSeek = 30;
     for (var fi = 0; fi < charts.length; fi++) {
-      var fData = dataStoreRef.current[charts[fi].field];
+      var fData = dataStoreRef.current[chartKey(charts[fi].field, charts[fi].type)];
       if (fData) {
         fpsForSeek = fData.fps || 30;
         break;
@@ -1278,7 +1781,7 @@
     var firstData = null;
     var statusTotalFrames = 0;
     for (var di = 0; di < charts.length; di++) {
-      var dd = dataStoreRef.current[charts[di].field];
+      var dd = dataStoreRef.current[chartKey(charts[di].field, charts[di].type)];
       if (dd) {
         firstData = dd;
         statusTotalFrames = dd.total_frames || dd.frames.length;
@@ -1335,20 +1838,33 @@
     }
 
     // --- Build "Add chart" options (fields not already in charts) ---
-    var usedFields = {};
+    var usedKeys = {};
     for (var ui = 0; ui < charts.length; ui++) {
-      usedFields[charts[ui].field] = true;
+      usedKeys[chartKey(charts[ui].field, charts[ui].type)] = true;
     }
-    var addOptions = fields.filter(function (f) {
-      return !usedFields[f.path];
-    });
+    var addOptions = [];
+    for (var oi = 0; oi < fields.length; oi++) {
+      var af = fields[oi];
+      if (af.has_labels) {
+        if (!usedKeys[chartKey(af.path, "labels")]) {
+          addOptions.push({ value: af.path + ":labels", label: af.path + " (labels)" });
+        }
+        if (!usedKeys[chartKey(af.path, "count")]) {
+          addOptions.push({ value: af.path + ":count", label: af.label });
+        }
+      } else {
+        if (!usedKeys[chartKey(af.path, "count")]) {
+          addOptions.push({ value: af.path + ":count", label: af.label });
+        }
+      }
+    }
 
     // --- Render: Multi-chart UI ---
     return h(
       Box,
       {
         ref: containerRef,
-        sx: { width: "100%", overflow: "hidden" },
+        sx: { width: "100%", height: "100%", display: "flex", flexDirection: "column", overflow: "hidden" },
       },
       // Toolbar with "Add chart" dropdown
       h(
@@ -1395,8 +1911,8 @@
             { value: "" },
             addOptions.length > 0 ? "Add chart\u2026" : "All fields added",
           ),
-          addOptions.map(function (f) {
-            return h("option", { key: f.path, value: f.path }, f.label);
+          addOptions.map(function (opt) {
+            return h("option", { key: opt.value, value: opt.value }, opt.label);
           }),
         ),
       ),
@@ -1406,7 +1922,8 @@
         {
           style: {
             overflowY: "auto",
-            maxHeight: charts.length > 2 ? (CHART_HEIGHT + 50) * 2 + "px" : "none",
+            flex: 1,
+            minHeight: 0,
           },
         },
         charts.length === 0
@@ -1428,8 +1945,9 @@
               ),
             )
           : charts.map(function (chart, idx) {
-              var fieldData = dataStoreRef.current[chart.field];
-              var status = chartStatus[chart.field] || { loading: true, error: null };
+              var cKey = chartKey(chart.field, chart.type);
+              var fieldData = dataStoreRef.current[cKey];
+              var status = chartStatus[cKey] || { loading: true, error: null };
               var chartTotalFrames = fieldData
                 ? (fieldData.total_frames || fieldData.frames.length)
                 : statusTotalFrames;
@@ -1438,7 +1956,11 @@
               var label = chart.field;
               for (var li = 0; li < fields.length; li++) {
                 if (fields[li].path === chart.field) {
-                  label = fields[li].label;
+                  if (chart.type === "labels") {
+                    label = chart.field + " (labels)";
+                  } else {
+                    label = fields[li].label;
+                  }
                   break;
                 }
               }
@@ -1446,6 +1968,7 @@
               return h(ChartCard, {
                 key: chart.id,
                 field: chart.field,
+                chartType: chart.type,
                 label: label,
                 data: fieldData,
                 loading: status.loading,
